@@ -122,10 +122,12 @@ resource "aws_instance" "app" {
     volume_type = "gp3"
   }
 
+  # python3-full ensures the complete standard library (including shutil, etc.)
+  # is present so Ansible's remote modules can execute without ImportErrors.
   user_data = <<-EOF
     #!/bin/bash
     apt-get update -y
-    apt-get install -y python3.11 python3.11-venv python3-pip nginx
+    apt-get install -y python3-full python3-pip nginx
   EOF
 
   tags = {

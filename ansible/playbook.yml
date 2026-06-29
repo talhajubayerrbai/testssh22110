@@ -3,8 +3,13 @@
   hosts: all
   become: true
   gather_facts: true
-
   vars:
+    # Pin to the system Python3 which always has the full standard library.
+    # Without this, Ansible auto-discovers /usr/bin/python3.11 (the minimal
+    # apt package) which is missing shutil and other stdlib modules, causing
+    # AnsiballZ_setup.py to crash with ModuleNotFoundError on the very first
+    # Gathering Facts task.
+    ansible_python_interpreter: /usr/bin/python3
     app_dir: /opt/app
     venv_dir: /opt/app/.venv
     app_user: ubuntu
@@ -22,6 +27,7 @@
     - name: Install required system packages
       apt:
         name:
+          - python3-full
           - python3.11
           - python3.11-venv
           - python3.11-dev
