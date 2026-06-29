@@ -1,0 +1,141 @@
+name: Deploy to EC2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    env:
+      TF_DIR: terraform
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Configure AWS credentials
+      # -----------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # 3. Generate SSH key pair (ephemeral - public half goes to Terraform)
+      # -----------------------------------------------------------------------
+      - name: Generate SSH key pair
+        run: |
+          ssh-keygen -t ed25519 -C "udap-deploy" -f "$HOME/.ssh/udap_deploy" -N ""
+          echo "SSH_PUBLIC_KEY=$(cat $HOME/.ssh/udap_deploy.pub)" >> "$GITHUB_ENV"
+          echo "SSH_PRIVATE_KEY_PATH=$HOME/.ssh/udap_deploy" >> "$GITHUB_ENV"
+          chmod 600 "$HOME/.ssh/udap_deploy"
+
+      # -----------------------------------------------------------------------
+      # 4. Setup Terraform
+      # -----------------------------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+          terraform_wrapper: false
+
+      # -----------------------------------------------------------------------
+      # 5. Terraform init
+      # -----------------------------------------------------------------------
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      # -----------------------------------------------------------------------
+      # 6. Terraform apply
+      # -----------------------------------------------------------------------
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -auto-approve \
+            -var="public_key=${{ env.SSH_PUBLIC_KEY }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}"
+
+      # -----------------------------------------------------------------------
+      # 7. Capture outputs
+      # -----------------------------------------------------------------------
+      - name: Capture Terraform outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          SERVER_IP=$(terraform output -raw instance_public_ip)
+          echo "SERVER_IP=${SERVER_IP}" >> "$GITHUB_ENV"
+          echo "Deploying to: ${SERVER_IP}"
+
+      # -----------------------------------------------------------------------
+      # 8. Wait for SSH to become available
+      # -----------------------------------------------------------------------
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for SSH on $SERVER_IP..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no \
+                   -o ConnectTimeout=5 \
+                   -o BatchMode=yes \
+                   -i "$SSH_PRIVATE_KEY_PATH" \
+                   ubuntu@"$SERVER_IP" "echo ok" 2>/dev/null; then
+              echo "SSH is ready."
+              break
+            fi
+            echo "Attempt $i/30 - retrying in 10s..."
+            sleep 10
+          done
+
+      # -----------------------------------------------------------------------
+      # 9. Install Ansible
+      # -----------------------------------------------------------------------
+      - name: Install Ansible
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install ansible
+
+      # -----------------------------------------------------------------------
+      # 10. Run Ansible playbook
+      # -----------------------------------------------------------------------
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook ansible/playbook.yml \
+            -i "$SERVER_IP," \
+            --private-key "$SSH_PRIVATE_KEY_PATH" \
+            -u ubuntu \
+            -e "server_ip=$SERVER_IP"
+
+      # -----------------------------------------------------------------------
+      # 11. Self-verify: hit /health and fail on non-2xx/3xx
+      # -----------------------------------------------------------------------
+      - name: Self-verify health endpoint
+        run: |-
+          echo "Waiting 15s for services to stabilise..."
+          sleep 15
+          echo "Curling http://${SERVER_IP}/health ..."
+          HTTP_CODE=$(curl -s -o /tmp/health_response.txt -w "%{http_code}" \
+            --retry 6 --retry-delay 10 --retry-all-errors \
+            "http://${SERVER_IP}/health")
+          echo "Response body:"
+          cat /tmp/health_response.txt
+          echo ""
+          echo "HTTP status code: ${HTTP_CODE}"
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -gt 399 ]; then
+            echo "ERROR: Health check returned HTTP ${HTTP_CODE} - deploy failed."
+            exit 1
+          fi
+          echo "Health check passed with HTTP ${HTTP_CODE}."
